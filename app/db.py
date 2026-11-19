@@ -41,6 +41,26 @@ CREATE TABLE IF NOT EXISTS observations (
 
 CREATE INDEX IF NOT EXISTS idx_observations_utc_ms ON observations(utc_ms);
 CREATE INDEX IF NOT EXISTS idx_observations_segment ON observations(boot_segment);
+
+-- 联测资料（整批替换）：海图零点、各开机段标尺、联测记录。
+-- 三张表始终在同一个事务里整体替换，查询只读取同一已提交版本。
+CREATE TABLE IF NOT EXISTS survey_meta (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    chart_datum  TEXT NOT NULL       -- 海图零点基准名
+);
+
+CREATE TABLE IF NOT EXISTS survey_staff (
+    boot_segment TEXT PRIMARY KEY,   -- 开机段
+    staff        TEXT NOT NULL       -- 该段所用标尺（基准名）
+);
+
+CREATE TABLE IF NOT EXISTS survey_connections (
+    seq           INTEGER NOT NULL,  -- 资料内的原始顺序
+    connection_id TEXT PRIMARY KEY,  -- 联测记录唯一编号
+    from_datum    TEXT NOT NULL,     -- 起点基准
+    to_datum      TEXT NOT NULL,     -- 终点基准
+    delta_mm      INTEGER NOT NULL   -- 从起点换到终点要加的毫米数
+);
 """
 
 
@@ -63,6 +83,22 @@ def get_conn() -> sqlite3.Connection:
 def lock() -> threading.RLock:
     """读写共用的进程级锁：写事务进行中，查询不会读到中间态。"""
     return _lock
+
+
+@contextmanager
+def read_transaction(conn: sqlite3.Connection):
+    """单条只读快照：一条查询里的多次 SELECT 看到同一已提交状态。
+
+    调用方需持有 lock()。SQLite 的 DEFERRED 事务在首个 SELECT 时确定快照，
+    因此观测与联测资料不会来自替换前后两个版本。
+    """
+    conn.execute("BEGIN")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
 
 
 @contextmanager

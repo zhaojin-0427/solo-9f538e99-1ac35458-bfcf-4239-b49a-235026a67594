@@ -3,6 +3,7 @@
 浮标每次重启都会把毫秒计数归零，潮位分析却需要一条可信的 UTC 时间线。
 本服务（FastAPI + SQLite）接收「开机段 + 段内计数」的观测与校时点，
 把计数线性换算成 UTC 毫秒，并维护观测的可用状态供分析查询。
+另外接收整批联测资料，把各开机段不同标尺的潮位换算到海图零点。
 
 ## 快速开始
 
@@ -58,6 +59,31 @@ pytest                 # 运行测试
 完成，并由进程级锁串行化读写：原文、校时依据、分析供数同次生效，
 查询和（崩溃后的）重启都不会看到半次重算的中间态。
 
+## 海图零点换算
+
+不同开机段的潮位可能来自不同标尺，整编海图前要统一到海图零点。
+联测资料（海图零点基准名、各开机段所用标尺、最多 16 条联测记录）
+通过 `PUT /survey` **整批替换**。
+
+- **联测记录**：`connection_id`（唯一编号）、`from_datum`（起点基准）、
+  `to_datum`（终点基准）、`delta_mm`（从起点换到终点要加的毫米数，整数）。
+  反向使用时取反。
+- **换算**：在基准名构成的无向图上寻找「该段标尺 → 海图零点」的路线，
+  把路线累计高差（毫米）加到以米计的原潮位上，返回换算潮位与沿途
+  联测编号。历史观测也按当前资料换算。
+- **待联测**（`pending_survey`）：该段未登记标尺，或标尺到海图零点无路线。
+- **待复测**（`pending_resurvey`）：存在两条**各自不重复经过基准点**的
+  路线，且累计高差不同。此时返回两条路线的联测编号与高差，不给换算值。
+- **旁支闭环**：只接在一个基准点上的闭环会产生重复基准点的路线，
+  不是简单路线，因此不影响换算。
+- 未校时（`pending_calibration`）或冲突（`conflict`）的观测不进入
+  换算查询，与 `/tide-levels` 的可用口径一致。
+
+联测资料三张表与观测同在 SQLite，资料替换是单个事务：替换失败（校验
+或写入错误）整批回滚、旧资料照常供数；查询在只读事务快照中进行，
+补传、校时与资料替换交错时，每次查询只看到同一已提交状态的观测与
+联测资料。资料与观测都落盘，重启后仍可查询。
+
 ## API
 
 均可在 `/docs` 中直接调用。
@@ -93,9 +119,72 @@ pytest                 # 运行测试
 }
 ```
 
-### `GET /tide-levels?start_ms=...&end_ms=...` — 按 UTC 范围查可用潮位
+### `GET /tide-levels?start_ms=...&end_ms=...` — 按 UTC 范围查可用原潮位
 
-只返回 `status=ok` 的观测，区间含端点，按 UTC 毫秒升序。
+只返回 `status=ok` 的观测，区间含端点，按 UTC 毫秒升序。潮位为原始值，
+不做海图零点换算（换算见 `/chart-tide-levels`）。
+
+### `PUT /survey` — 整批替换联测资料
+
+```json
+{
+  "chart_datum": "chart-0",
+  "staffs": [
+    {"boot_segment": "boot-1", "staff": "staff-A"},
+    {"boot_segment": "boot-2", "staff": "staff-B"}
+  ],
+  "connections": [
+    {"connection_id": "s1", "from_datum": "staff-A", "to_datum": "staff-B", "delta_mm": 120},
+    {"connection_id": "s2", "from_datum": "staff-B", "to_datum": "chart-0", "delta_mm": -35}
+  ]
+}
+```
+
+- 三部分一次性整体替换旧资料；`connections` 最多 16 条，`connection_id`
+  必须唯一（否则 `422`，旧资料不变）。`staffs`、`connections` 可省略。
+- 写入失败整批回滚，旧资料照常供数；资料落盘，重启后仍在。
+- 响应回显已提交的资料，附 `staff_count` / `connection_count`。
+- `GET /survey` 查看当前资料。
+
+### `GET /chart-tide-levels?start_ms=...&end_ms=...` — 换算到海图零点
+
+按 UTC 范围逐条返回可用观测（`status=ok`）及其换算结果：
+
+```json
+{
+  "count": 1,
+  "chart_datum": "chart-0",
+  "items": [
+    {
+      "obs_id": "obs-1", "utc_ms": 1700000000500,
+      "status": "ok", "reason": null,
+      "original_tide_level": 2.34,
+      "tide_level": 2.425, "chart_tide_level": 2.425, "delta_mm": 85,
+      "connection_ids": ["s1", "s2"],
+      "routes": []
+    }
+  ]
+}
+```
+
+- `status=ok`：`tide_level`（同 `chart_tide_level`）为原潮位加路线累计高差，
+  `connection_ids` 为沿途联测编号。
+- `status=pending_survey`（待联测）：未登记标尺或无路线，换算值为 `null`。
+- `status=pending_resurvey`（待复测）：两条简单路线高差不同，换算值为
+  `null`，`routes` 给出两条路线的 `connection_ids` 与 `delta_mm`：
+
+```json
+{
+  "obs_id": "obs-2", "utc_ms": 1700000000600,
+  "status": "pending_resurvey", "reason": "……待复测",
+  "original_tide_level": 2.5, "tide_level": null, "chart_tide_level": null,
+  "connection_ids": [],
+  "routes": [
+    {"connection_ids": ["d1"], "delta_mm": 100},
+    {"connection_ids": ["d2a", "d2b"], "delta_mm": 130}
+  ]
+}
+```
 
 ### `GET /observations/{obs_id}` — 按观测 ID 查状态和原因
 
@@ -122,11 +211,13 @@ pytest                 # 运行测试
 
 ```
 app/
-  main.py   # FastAPI 路由与请求/响应模型
-  core.py   # 校时换算、批量写入、重算、冲突检测、变更快照
-  db.py     # SQLite 连接、模式、事务与锁
+  main.py    # FastAPI 路由与请求/响应模型
+  core.py    # 校时换算、批量写入、重算、冲突检测、变更快照
+  survey.py  # 联测资料替换、基准网路线、海图零点换算
+  db.py      # SQLite 连接、模式、事务与锁
 tests/
-  test_api.py
+  test_api.py     # 校时、冲突、原子性
+  test_survey.py  # 联测资料、海图零点换算
 Dockerfile
 docker-compose.yml
 ```
